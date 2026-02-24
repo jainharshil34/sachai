@@ -1,0 +1,7 @@
+streamlit==1.41.0
+python-dotenv==1.0.1
+openai==1.58.1
+requests==2.32.3
+Pillow==11.0.0
+gTTS==2.5.4
+
