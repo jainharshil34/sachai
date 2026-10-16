@@ -1,178 +1,125 @@
-🛡️ SachAI – India’s Real-Time Multilingual Fact-Check Shield
+# 🛡️ SachAI – India's Daily Misinformation & Cyber Scam Shield
 
-SachAI is a **multimodal misinformation detection platform** built for India.
-It verifies **text claims, screenshots, and voice notes** in real-time using official government portals, PIB Fact Check, and credible news sources.
+**SachAI** is a real-time, multimodal fact-checking and anti-scam platform designed specifically for daily life in India. It combats viral WhatsApp rumours, suspicious SMS messages, phishing links, and fake government orders through modular AI verification, evidence provenance, and uncertainty-aware verdicts.
 
-📌 Overview
-Misinformation spreads rapidly across WhatsApp forwards, social media posts, and voice notes — especially in Tier-2 and Tier-3 cities.
-SachAI provides:
-* Real-time verification
-* Hyperlocal reasoning
-* Multilingual explanations (Hindi + English)
-* Shareable debunk tools
+---
 
- 🧰 Tech Stack
-* Streamlit – Frontend UI
-* Perplexity API – Live RAG-based verification
-* OpenAI (Vision + Whisper) – Screenshot claim extraction & voice transcription
-* gTTS – Hindi audio generation
-* PIL (Pillow) – Truth Card image generation
-* Python – Backend logic
+## 🏗️ Phase 1 Modular Architecture
 
-🚀 Features
+The repository is organized with a decoupled, testable architecture:
 
- 1. Text Claim Verification
-
-* Paste WhatsApp forwards or social media posts
-* Optional city/district input for hyperlocal context
-* Simple Hindi + English explanations
-* Confidence score
-* Live citations
-
- 2. Screenshot Verification
- 
-* Upload screenshots (.png / .jpg / .jpeg)
-* Vision model extracts core claim
-* Automatic verification
-* Structured verdict response
-
- 3. Voice Note Verification
-
-* Upload voice notes (.ogg / .mp3 / .wav / .m4a)
-* Whisper transcription
-* Fact-checking of transcribed content
-* Hindi debunk audio generation
-
-4. Shareable Truth Tools
-
-* WhatsApp-ready short debunk text (Hindi + English)
-* Downloadable Truth Card (PNG)
-* Downloadable Hindi debunk audio (MP3)
-
-Designed to help users verify before forwarding.
-
- 🏗 System Architecture
-
-
-User Input
-   ├── Text
-   ├── Screenshot
-   └── Voice Note
-        ↓
-Claim Extraction
-   ├── GPT Vision
-   └── Whisper
-        ↓
-Live Web Verification (Perplexity API)
-        ↓
-Structured JSON Verdict
-        ↓
-Outputs:
-   ├── Verdict UI
-   ├── Source Links
-   ├── Truth Card Image
-   └── Hindi Audio Debunk
-
-
-# ⚙️ Installation
-
- 1. Clone Repository
-
-```bash
-git clone https://github.com/your-username/sachai.git
-cd sachai
 ```
-
-2. Create Virtual Environment
-
-```bash
-python -m venv venv
-source venv/bin/activate   # macOS/Linux
-venv\Scripts\activate      # Windows
-```
-
-3. Install Dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-If no requirements file:
-
-```bash
-pip install streamlit openai requests pillow gtts
+sach-ai/
+├── core/                       # Decoupled business logic & pipelines
+│   ├── __init__.py             # Core package initialization
+│   ├── models.py               # Validated Pydantic domain models
+│   ├── pipeline.py             # Orchestrator with prompt injection defense
+│   ├── provenance.py           # Authority tiering & source deduplication
+│   ├── storage.py              # AbstractStorage & SQLite implementation
+│   ├── tracing.py              # Structured telemetry, correlation IDs & error sanitization
+│   └── evaluator.py            # Deterministic metrics (citation score, abstention, consistency)
+├── tests/                      # Automated pytest suite (100% offline, 0 API key required)
+│   ├── test_models.py          # Schema validation & boundary tests
+│   ├── test_provenance.py      # Source authority tiering & deduplication tests
+│   ├── test_storage.py         # SQLite persistence & retrieval tests
+│   ├── test_pipeline_offline.py# Offline fact-checking & abstention tests
+│   ├── test_scam_detection.py  # Scam SMS & APK malware heuristic tests
+│   ├── test_prompt_injection.py# Injection defense & delimiter breakout tests
+│   ├── test_truth_card.py      # PIL Truth Card image generation tests
+│   └── test_evaluator.py       # Deterministic evaluation metrics tests
+├── .github/workflows/ci.yml    # GitHub Actions automated CI testing
+├── app.py                      # Clean Streamlit user interface
+├── gemini_engine.py            # Free Gemini REST engine & verified PIB archive
+└── requirements.txt            # Pinned runtime dependencies
 ```
 
 ---
 
-🔑 API Keys
+## ⚡ Zero-Cost & 100% Free API Architecture
 
-SachAI supports per-user API key configuration via the sidebar.
+Unlike tools requiring expensive paid subscriptions, SachAI is built to run on **completely free APIs**:
 
-You may:
+1. **Google Gemini 1.5 / 2.0 Flash (Free API):**
+   * Free tier (15 requests/min, zero credit card required) from [Google AI Studio](https://aistudio.google.com/app/apikey).
+   * Real-time Google Search grounding.
+   * Multimodal analysis for screenshots (OCR + forensic inspection) and voice notes.
+2. **Built-in PIB & Cyber Threat Intelligence Archive (Zero Keys Needed):**
+   * Instant verification for India's most common viral scams and rumours even with *no API key configured*.
+3. **Free Text-To-Speech (gTTS):**
+   * Generates natural Hindi audio debunks without any paid API keys.
+4. **Optional Providers:** Supports Perplexity (Sonar) and OpenAI (GPT-4o) if keys are provided.
 
-Option A – Environment Variables
+---
+
+## 💾 Storage & Schema Strategy
+
+* **Engine:** Local thread-safe SQLite database (`sachai_history.db`).
+* **Table Schema (`verification_history`):**
+  * `id`: Auto-incrementing primary key.
+  * `correlation_id`: Unique trace identifier (`sach-xxxx`).
+  * `claim`: Sanitized input text (up to 3,000 characters).
+  * `verdict`: Structured verdict (`Likely True`, `Likely False`, `Cyber Fraud / Scam`, `Unclear`).
+  * `confidence`: Calibrated integer score (0–100).
+  * `category`: Categorization (e.g. `Government Scheme`, `Finance / Banking`, `Rumour / Panic`).
+  * `risk_level`: Severity level (`Low`, `Moderate`, `High Viral Threat`, `Severe Scam`).
+  * `engine_used`: Backend provider attribution.
+  * `created_at`: UTC ISO timestamp.
+  * `payload_json`: Full versioned result snapshot.
+* **Privacy & DPDP Safety:** Raw image and audio binaries are **never stored** in the database; only extracted claims, metadata, and structured verdicts are retained.
+
+---
+
+## 🛡️ Security & Prompt Injection Defense
+
+* **Untrusted Claim Delimitation:** User-submitted forwards are encapsulated inside `<UNTRUSTED_CLAIM_CONTENT>` delimiters before prompt assembly.
+* **Adversarial Sanitization:** Explicit regex filters strip jailbreaks (`Ignore all previous instructions`, instruction override tokens, and XML tag injections).
+* **Credential Masking:** Telemetry and error sanitization (`core/tracing.py`) mask Gemini, OpenAI, and Perplexity keys from error logs and client responses.
+* **Separation of Concerns:** API failures and timeouts never result in factual verdicts (`True` or `False`); the system safely abstains with clear explanation.
+
+---
+
+## 📊 Deterministic Evaluation Framework
+
+The evaluation engine (`core/evaluator.py`) provides verifiable, deterministic quality metrics:
+
+* **Citation Support Score:** Weighted metric ($0.0 \to 1.0$) prioritizing Tier-1 official portals (`.gov.in`, `rbi.org.in`, `pib.gov.in`) and Tier-2 IFCN fact-checkers.
+* **Verdict Consistency Check:** Enforces logical coherence between verdicts and risk ratings (e.g., prevents "Likely True" with "Severe Scam").
+* **Abstention Rate:** Measures the fraction of queries where SachAI responsibly returns "Unclear" due to insufficient credible evidence, avoiding hallucinations.
+
+---
+
+## 🧪 Running Automated Tests
+
+Run the complete offline test suite (runs in ~3 seconds with zero external network calls):
 
 ```bash
-export OPENAI_API_KEY="your_key"
-export PERPLEXITY_API_KEY="your_key"
+pytest -v tests/
 ```
 
-Option B – Paste Keys in Sidebar
-
-API keys are stored only in the active browser session.
-
- ▶️ Run the Application
+Run test suite with coverage report:
 
 ```bash
-streamlit run app.py
+pytest --cov=core tests/
 ```
 
-Open in browser:
+---
 
-```
-http://localhost:8501
-```
+## 🚀 Quickstart
 
+1. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
+2. **(Optional) Configure your Free Gemini API Key:**
+   * Get a free key at [Google AI Studio](https://aistudio.google.com/app/apikey).
+   * Either paste it into the UI sidebar or set it in `.env`:
+     ```env
+     GEMINI_API_KEY=your_gemini_key_here
+     ```
+   * *Note: SachAI still functions out of the box with zero keys using its built-in PIB intelligence archive!*
 
-🧠 Verification Logic
-
-The system:
-
-1. Searches the real-time web
-2. Prioritizes:
-
-   * PIB Fact Check
-   * Official .gov.in portals
-   * WHO / UN
-   * Major Indian news outlets
-3. Classifies claims as:
-
-   * Likely True
-   * Likely False
-   * Unclear
-4. Returns structured JSON including:
-
-   * Hindi explanation
-   * English explanation
-   * Confidence score
-   * WhatsApp summaries
-   * Source citations
-
-
-# 🔐 Safety Principles
-
-* Does not assume claims are false by default
-* Uses "Unclear" when evidence is weak
-* Encourages responsible sharing
-* Provides multilingual explanations
-
-# 📈 Future Improvements
-
-* Regional misinformation heatmap (live clustering)
-* Admin analytics dashboard
-* WhatsApp bot integration
-* Telegram bot integration
-* Regional language expansion
-
+3. **Launch the application:**
+   ```bash
+   streamlit run app.py
+   ```

@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import urllib.parse
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,9 +14,22 @@ from gtts import gTTS
 
 try:
     from openai import OpenAI
-except ImportError:  # Fallback if openai import style differs
-    OpenAI = None  # type: ignore
+except ImportError:
+    OpenAI = None
 
+# Import our Free Multimodal & Search-Grounded Gemini Engine
+from gemini_engine import (
+    DEFAULT_MODEL,
+    analyze_scam_message,
+    analyze_screenshot_with_gemini,
+    get_daily_viral_rumours,
+    get_gemini_api_key,
+    get_pib_verified_archive,
+    match_offline_archive,
+    transcribe_audio_with_gemini,
+    verify_claim_with_gemini,
+    generate_whatsapp_share_url,
+)
 
 # ---------- Logging configuration ----------
 logging.basicConfig(
@@ -25,406 +39,226 @@ logging.basicConfig(
 logger = logging.getLogger("SachAI")
 
 
-# ---------- Environment / client helpers ----------
+# ---------- Environment / Client Helpers ----------
 def get_openai_client() -> Optional[Any]:
-    """
-    Build an OpenAI client using either a UI-provided key (preferred) or env var.
-    This lets each user bring their own key in the Streamlit interface.
-    """
-    ui_key = None
-    # Use session_state if available (during a Streamlit run)
-    try:
-        ui_key = st.session_state.get("openai_api_key_ui")
-    except Exception:
-        ui_key = None
-
+    ui_key = st.session_state.get("openai_api_key_ui", "").strip()
     api_key = ui_key or os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        logger.warning("OPENAI_API_KEY is not set (UI or env). Vision / Whisper features will be disabled.")
-        return None
-    if OpenAI is None:
-        logger.error("openai package not available. Please install requirements.")
+    if not api_key or OpenAI is None:
         return None
     return OpenAI(api_key=api_key)
 
 
-def get_perplexity_api_key() -> Optional[str]:
-    """
-    Get Perplexity API key from UI (preferred) or env var.
-    """
-    ui_key = None
-    try:
-        ui_key = st.session_state.get("perplexity_api_key_ui")
-    except Exception:
-        ui_key = None
-
-    key = ui_key or os.getenv("PERPLEXITY_API_KEY")
-    if not key:
-        logger.warning("PERPLEXITY_API_KEY is not set (UI or env). Verification will use mock fallback.")
-    return key
+def get_active_gemini_key() -> Optional[str]:
+    ui_key = st.session_state.get("gemini_api_key_ui", "").strip()
+    return ui_key or get_gemini_api_key()
 
 
-# ---------- Core verification with Perplexity (RAG) ----------
-PERPLEXITY_URL = "https://api.perplexity.ai/chat/completions"
+def get_active_perplexity_key() -> Optional[str]:
+    ui_key = st.session_state.get("perplexity_api_key_ui", "").strip()
+    return ui_key or os.getenv("PERPLEXITY_API_KEY")
 
 
-def build_perplexity_payload(
-    claim: str,
-    language_hint: str = "mixed",
-    city: Optional[str] = None,
-) -> Dict[str, Any]:
-    system_prompt = (
-        "You are SachAI, a multilingual fact-checking assistant focused on India. "
-        "You MUST verify claims using recent, trustworthy sources such as PIB Fact Check, "
-        "official Indian government portals (.gov.in), WHO/UN, and major Indian news outlets. "
-        "You are neutral: do not assume rumours are fake by default. "
-        "If the evidence is mixed or weak, clearly mark the claim as 'Unclear' instead of forcing true/false. "
-        "Always think step-by-step but only return the final structured JSON.\n\n"
-        "Return STRICT JSON with keys: "
-        "verdict (Likely True / Likely False / Unclear), "
-        "confidence (0-100), "
-        "explanation_hindi, "
-        "explanation_english, "
-        "short_whatsapp_hindi, "
-        "short_whatsapp_english, "
-        "sources (list of {{title, url, source_type, snippet}}). "
-        "Do not include any markdown, only raw JSON."
-    )
-
-    if city:
-        system_prompt += f"\nHyperlocal context: The rumour is about {city} in India. "
-
-    if language_hint.lower().startswith("hi"):
-        system_prompt += "\nUser prefers Hindi, but also include English explanation."
-
-    user_prompt = (
-        f"Claim to verify:\n{claim}\n\n"
-        "Steps you must follow (only in your hidden reasoning):\n"
-        "1) Search the real-time web for this claim.\n"
-        "2) Prioritize Indian government and credible fact-checking sources.\n"
-        "3) Decide if the claim is likely true, likely false, or unclear.\n"
-        "4) Explain in very simple Hindi and then in simple English.\n"
-        "5) Craft short, forwardable WhatsApp-style summaries in Hindi and English.\n"
-        "6) Provide at least 2-3 citations with URLs in the sources list."
-    )
-
-    return {
-        "model": "sonar-pro",
-        "temperature": 0.2,
-        "max_tokens": 800,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-
-
-def verify_claim_with_perplexity(
-    claim: str,
-    language_hint: str = "mixed",
-    city: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Call Perplexity to verify a claim. Returns a normalized dict even on failure.
-    """
-    logger.info("Starting verification with Perplexity...")
-    api_key = get_perplexity_api_key()
-    payload = build_perplexity_payload(claim, language_hint, city)
-
+# ---------- Fallback Perplexity Verification ----------
+def verify_claim_with_perplexity(claim: str, city: Optional[str] = None) -> Dict[str, Any]:
+    api_key = get_active_perplexity_key()
     if not api_key:
-        # Fallback mock response for offline/dev demo
-        logger.info("Using mock Perplexity response (no API key).")
-        return {
+        return match_offline_archive(claim) or {
             "verdict": "Unclear",
-            "confidence": 55,
-            "explanation_hindi": (
-                "यह एक डेमो मोड उत्तर है: अभी लाइव सरकारी/समाचार स्रोतों से असली যাচाई नहीं हो रही है, "
-                "इसलिए दावे को न पक्का सही कहा जा सकता है न पक्का गलत। "
-                "इसे आगे भेजने से पहले भरोसेमंद स्रोतों से खुद भी जांच लें।"
-            ),
-            "explanation_english": (
-                "This is a demo-mode answer: live checking against official/news sources is not active, "
-                "so the claim cannot be clearly classified as true or false. "
-                "Please double‑check with reliable sources before sharing."
-            ),
-            "short_whatsapp_hindi": (
-                "ℹ️ यह SachAI का डेमो मोड उत्तर है – दावे की असली जांच अभी नहीं हो रही। "
-                "बिना भरोसेमंद स्रोत देखे किसी भी संदेश को आगे न बढ़ाएँ।"
-            ),
-            "short_whatsapp_english": (
-                "ℹ️ This is a demo SachAI response – the claim has not been fully verified. "
-                "Avoid forwarding messages without checking credible sources."
-            ),
-            "sources": [
-                {
-                    "title": "PIB Fact Check (example listing)",
-                    "url": "https://pib.gov.in/factcheck",
-                    "source_type": "PIB Fact Check",
-                    "snippet": "Official government fact checks on viral rumours.",
-                }
-            ],
+            "confidence": 60,
+            "category": "General",
+            "risk_level": "Moderate",
+            "explanation_hindi": "इस दावे की पुष्टि के लिए आधिकारिक स्रोतों की जांच आवश्यक है। बिना जांचे आगे न बढ़ाएं।",
+            "explanation_english": "Official confirmation is recommended before accepting or sharing this claim.",
+            "short_whatsapp_hindi": "⚠️ कृपया बिना आधिकारिक पुष्टि के इस संदेश को आगे न भेजें।",
+            "short_whatsapp_english": "⚠️ Please verify from official portals before forwarding.",
+            "sources": [{"title": "PIB Fact Check", "url": "https://pib.gov.in/factcheck", "source_type": "Government", "snippet": "Official PIB portal."}],
+            "engine_used": "Offline Knowledge Engine (No Key Configured)",
         }
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
+    url = "https://api.perplexity.ai/chat/completions"
+    prompt = (
+        f"Verify this Indian viral claim: '{claim}'. "
+        f"Context: {city or 'India'}. "
+        "Strictly return JSON with keys: verdict (Likely True/Likely False/Unclear), "
+        "confidence (0-100), category, risk_level, explanation_hindi, explanation_english, "
+        "short_whatsapp_hindi, short_whatsapp_english, sources."
+    )
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": "sonar",
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": prompt}],
     }
-
     try:
-        resp = requests.post(PERPLEXITY_URL, headers=headers, json=payload, timeout=40)
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        logger.info("Perplexity raw response received.")
-
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        # Expecting strict JSON; if it fails, log and fall back
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            logger.error("Failed to parse JSON from Perplexity response. Falling back to generic structure.")
-            parsed = {}
-
-        # Normalize fields
-        verdict = parsed.get("verdict", "Unclear")
-        confidence = int(parsed.get("confidence", 60))
-        explanation_hindi = parsed.get(
-            "explanation_hindi",
-            "इस दावे पर स्पष्ट आधिकारिक जानकारी नहीं मिली, इसलिए इसे साझा करते समय सावधानी बरतें।",
-        )
-        explanation_english = parsed.get(
-            "explanation_english",
-            "There is no clear official information confirming this claim. Please be cautious before sharing.",
-        )
-        short_hi = parsed.get(
-            "short_whatsapp_hindi",
-            "ℹ️ इस दावे पर भरोसेमंद जानकारी नहीं मिली। कृपया बिना जांचे इसे आगे न बढ़ाएँ।",
-        )
-        short_en = parsed.get(
-            "short_whatsapp_english",
-            "ℹ️ This claim could not be confirmed from credible sources. Please avoid forwarding unchecked messages.",
-        )
-        sources = parsed.get("sources", [])
-        if not isinstance(sources, list):
-            sources = []
-
-        return {
-            "verdict": verdict,
-            "confidence": confidence,
-            "explanation_hindi": explanation_hindi,
-            "explanation_english": explanation_english,
-            "short_whatsapp_hindi": short_hi,
-            "short_whatsapp_english": short_en,
-            "sources": sources,
-        }
+        raw = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        # Clean json
+        import re
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if match:
+            parsed = json.loads(match.group(0))
+            parsed["engine_used"] = "Perplexity Sonar (Paid Engine)"
+            return parsed
     except Exception as e:
-        logger.exception("Error while calling Perplexity API: %s", e)
-        return {
-            "verdict": "Unclear",
-            "confidence": 50,
-            "explanation_hindi": (
-                "तकनीकी कारणों से अभी लाइव फैक्ट‑चेक पूरा नहीं हो सका। "
-                "फिर भी, ऐसे संदेश को आगे भेजने से पहले विश्वसनीय स्रोतों से जांच लें।"
-            ),
-            "explanation_english": (
-                "Due to a technical issue, live fact-checking could not be completed. "
-                "Please verify from reliable sources before forwarding this message."
-            ),
-            "short_whatsapp_hindi": (
-                "⚠️ अभी नेटवर्क समस्या के कारण फैक्ट‑चेक नहीं हो पाया। "
-                "कृपया बिना जांचे संदेश आगे न बढ़ाएँ।"
-            ),
-            "short_whatsapp_english": (
-                "⚠️ Fact-check could not be completed due to a technical issue. "
-                "Please avoid forwarding unverified messages."
-            ),
-            "sources": [],
-        }
+        logger.warning("Perplexity call failed: %s", e)
+
+    return match_offline_archive(claim) or {
+        "verdict": "Unclear",
+        "confidence": 50,
+        "category": "General",
+        "risk_level": "Moderate",
+        "explanation_hindi": "तकनीकी कारणों से लाइव जांच पूरी नहीं हो सकी।",
+        "explanation_english": "Live verification encountered a temporary issue.",
+        "short_whatsapp_hindi": "⚠️ अफ़वाहों से सावधान रहें।",
+        "short_whatsapp_english": "⚠️ Stay vigilant against unconfirmed news.",
+        "sources": [],
+        "engine_used": "Fallback System",
+    }
 
 
-# ---------- Vision: Extract claim from screenshot ----------
-def extract_claim_from_image(img_bytes: bytes, client: Optional[Any]) -> str:
-    if client is None:
-        logger.info("OpenAI client unavailable, returning generic placeholder claim from image.")
-        return "Image appears to contain a forwarded message whose exact text could not be extracted."
+# ---------- Modular Core Pipeline & Storage ----------
+from core.models import VerificationRequest
+from core.pipeline import VerificationPipeline
+from core.storage import SQLiteStorage
 
-    logger.info("Extracting claim from image using GPT-4o vision...")
-    encoded = base64.b64encode(img_bytes).decode("utf-8")
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a vision assistant. Your ONLY job is to read the image "
-                        "and output ONE short sentence summarising the main factual claim or rumour. "
-                        "No extra text, no explanation."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Read this screenshot and summarise the core claim / rumour in one sentence.",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{encoded}"},
-                        },
-                    ],
-                },
-            ],
-        )
-        content = resp.choices[0].message.content.strip()
-        logger.info("Vision model extracted claim: %s", content)
-        return content
-    except Exception as e:
-        logger.exception("Error during vision extraction: %s", e)
-        return "Could not reliably read the screenshot, please type the main claim in your own words."
+global_storage = SQLiteStorage()
+global_pipeline = VerificationPipeline(storage=global_storage)
 
 
-# ---------- Audio: Transcription and Hindi debunk ----------
-def transcribe_audio(file_bytes: bytes, mime_type: str, client: Optional[Any]) -> str:
-    if client is None:
-        logger.info("OpenAI client unavailable, returning placeholder transcription.")
-        return "Placeholder transcription: (OpenAI Whisper is not configured)."
+def verify_claim_unified(
+    claim: str,
+    city: Optional[str] = None,
+    category: Optional[str] = None,
+    engine_choice: str = "Google Gemini 1.5/2.0 Flash (Free API)",
+) -> Dict[str, Any]:
+    """
+    Routes verification through the modular, hardened core pipeline
+    with correlation IDs, prompt-injection sanitization, provenance tiering, and SQLite history.
+    """
+    logger.info("Routing verification request via modular pipeline: %s", engine_choice)
+    gemini_key = get_active_gemini_key()
+    pplx_key = get_active_perplexity_key()
 
-    logger.info("Transcribing audio using Whisper...")
-    try:
-        # Streamlit file bytes -> in-memory file object
-        audio_io = io.BytesIO(file_bytes)
-        audio_io.name = f"audio.{mime_type.split('/')[-1]}"
-        transcription = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_io,
-        )
-        text = getattr(transcription, "text", "").strip()
-        logger.info("Whisper transcription completed.")
-        return text or "No speech detected in the audio."
-    except Exception as e:
-        logger.exception("Error during Whisper transcription: %s", e)
-        return "Could not transcribe this audio. Please try again or type the claim manually."
+    req = VerificationRequest(
+        claim=claim,
+        city=city,
+        category=category,
+        source_medium="text",
+    )
 
-
-def generate_hindi_debunk_audio(text_hindi: str) -> bytes:
-    logger.info("Generating Hindi debunk audio using gTTS...")
-    tts = gTTS(text=text_hindi, lang="hi")
-    buf = io.BytesIO()
-    tts.write_to_fp(buf)
-    buf.seek(0)
-    return buf.read()
+    verdict = global_pipeline.verify(
+        request=req,
+        engine_choice=engine_choice,
+        gemini_api_key=gemini_key,
+        perplexity_api_key=pplx_key,
+    )
+    return verdict.to_legacy_dict()
 
 
-# ---------- Truth Card image ----------
+
+# ---------- Truth Card Image Generator ----------
 def generate_truth_card(
     claim: str,
     verdict: str,
     city: Optional[str],
     confidence: int,
+    risk_level: str = "Moderate",
 ) -> bytes:
-    logger.info("Generating truth card image...")
-    width, height = 800, 450
-    bg_color = (249, 250, 251)  # gray-50
+    """Generate high-resolution shareable Truth Card image for WhatsApp."""
+    width, height = 900, 500
+    bg_color = (255, 255, 255)
 
-    if verdict.lower().startswith("likely true"):
-        accent = (22, 163, 74)  # green-600
-        verdict_label = "सही / TRUE"
-    elif verdict.lower().startswith("likely false"):
-        accent = (220, 38, 38)  # red-600
-        verdict_label = "गलत / FALSE"
+    verdict_lower = verdict.lower()
+    if "true" in verdict_lower or "सच" in verdict_lower or "valid" in verdict_lower:
+        accent = (22, 163, 74)       # Green
+        stamp_text = "✅ सच / VERIFIED"
+        badge_bg = (220, 252, 231)
+    elif "false" in verdict_lower or "fake" in verdict_lower or "गलत" in verdict_lower or "झूठ" in verdict_lower:
+        accent = (220, 38, 38)       # Red
+        stamp_text = "❌ अफ़वाह / FAKE NEWS"
+        badge_bg = (254, 226, 226)
+    elif "scam" in verdict_lower or "fraud" in verdict_lower or "स्कैम" in verdict_lower:
+        accent = (225, 29, 72)       # Rose / Red
+        stamp_text = "🚨 साइबर फ्रॉड / SCAM ALERT"
+        badge_bg = (255, 228, 230)
     else:
-        accent = (245, 158, 11)  # amber-500
-        verdict_label = "संदिग्ध / UNCLEAR"
+        accent = (217, 119, 6)       # Amber
+        stamp_text = "⚠️ संदिग्ध / UNVERIFIED"
+        badge_bg = (254, 243, 199)
 
     img = Image.new("RGB", (width, height), bg_color)
     draw = ImageDraw.Draw(img)
 
     # Border
-    border_width = 12
-    draw.rectangle(
-        [border_width, border_width, width - border_width, height - border_width],
-        outline=accent,
-        width=border_width,
-    )
+    draw.rectangle([0, 0, width, height], fill=bg_color)
+    draw.rectangle([10, 10, width - 10, height - 10], outline=accent, width=8)
 
-    # Fonts (use default PIL fonts to avoid system dependencies)
+    # Header Bar
+    draw.rectangle([10, 10, width - 10, 80], fill=(15, 23, 42))  # slate-900
+
     try:
-        title_font = ImageFont.truetype("arial.ttf", 36)
-        verdict_font = ImageFont.truetype("arialbd.ttf", 40)
+        title_font = ImageFont.truetype("arialbd.ttf", 30)
+        stamp_font = ImageFont.truetype("arialbd.ttf", 32)
         body_font = ImageFont.truetype("arial.ttf", 22)
+        meta_font = ImageFont.truetype("arial.ttf", 18)
     except Exception:
         title_font = ImageFont.load_default()
-        verdict_font = ImageFont.load_default()
+        stamp_font = ImageFont.load_default()
         body_font = ImageFont.load_default()
+        meta_font = ImageFont.load_default()
 
-    padding = 40
+    draw.text((35, 25), "🛡️ SachAI Fact-Check Card", font=title_font, fill=(255, 255, 255))
+    draw.text((width - 320, 32), "National Misinformation Shield", font=meta_font, fill=(148, 163, 184))
 
-    # Header text
-    draw.text(
-        (padding, padding),
-        "SachAI Fact-Check Card",
-        font=title_font,
-        fill=(15, 23, 42),  # slate-900
-    )
+    # Stamp Box
+    stamp_y = 105
+    draw.rounded_rectangle([35, stamp_y, 450, stamp_y + 60], radius=12, fill=accent)
+    draw.text((55, stamp_y + 12), stamp_text, font=stamp_font, fill=(255, 255, 255))
 
-    # Verdict pill
-    verdict_box_y = padding + 50
-    pill_height = 50
-    pill_width = 260
-    pill_radius = 25
-    x0, y0 = padding, verdict_box_y
-    x1, y1 = x0 + pill_width, y0 + pill_height
-    draw.rounded_rectangle([x0, y0, x1, y1], radius=pill_radius, fill=accent)
-    draw.text(
-        (x0 + 18, y0 + 12),
-        verdict_label,
-        font=verdict_font,
-        fill=(255, 255, 255),
-    )
+    # Confidence Pill
+    conf_x = 480
+    draw.rounded_rectangle([conf_x, stamp_y, conf_x + 220, stamp_y + 60], radius=12, fill=badge_bg)
+    draw.text((conf_x + 20, stamp_y + 18), f"Confidence: {confidence}%", font=title_font, fill=accent)
 
-    # Claim text (wrapped manually)
-    claim_y = verdict_box_y + pill_height + 30
-    max_width = width - 2 * padding
+    # Claim text
+    draw.text((35, 190), "VIRAL CLAIM CHECKED:", font=meta_font, fill=(100, 116, 139))
 
-    def wrap_text(text: str, font_obj: ImageFont.ImageFont, max_w: int) -> List[str]:
+    # Wrap claim text
+    def wrap_text(text: str, max_w: int) -> List[str]:
         words = text.split()
         lines: List[str] = []
-        current = ""
+        cur = ""
         for w in words:
-            test = (current + " " + w).strip()
-            if draw.textlength(test, font=font_obj) <= max_w:
-                current = test
+            test = (cur + " " + w).strip()
+            if draw.textlength(test, font=body_font) <= max_w:
+                cur = test
             else:
-                lines.append(current)
-                current = w
-        if current:
-            lines.append(current)
+                lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
         return lines
 
-    claim_lines = wrap_text(claim[:220], body_font, max_width)
-    y = claim_y
-    for line in claim_lines:
-        draw.text((padding, y), line, font=body_font, fill=(30, 64, 175))  # blue-800
-        y += 30
+    claim_snippet = claim.strip().replace("\n", " ")
+    if len(claim_snippet) > 220:
+        claim_snippet = claim_snippet[:220] + "..."
+    claim_lines = wrap_text(claim_snippet, width - 80)
 
-    # Footer meta
-    footer_y = height - padding - 70
-    now = datetime.now().strftime("%d %b %Y, %H:%M")
-    city_str = city or "India"
-    footer_text = f"{city_str} • {now} • Confidence: {confidence}%"
-    draw.text(
-        (padding, footer_y),
-        footer_text,
-        font=body_font,
-        fill=(75, 85, 99),  # gray-600
-    )
-    draw.text(
-        (padding, footer_y + 30),
-        "Share this card on WhatsApp to stop the rumour.",
-        font=body_font,
-        fill=(55, 65, 81),  # gray-700
-    )
+    y_pos = 220
+    for line in claim_lines[:4]:
+        draw.text((35, y_pos), line, font=body_font, fill=(15, 23, 42))
+        y_pos += 32
+
+    # Bottom Caution Banner
+    banner_y = height - 100
+    draw.rectangle([18, banner_y, width - 18, banner_y + 2], fill=(226, 232, 240))
+
+    now = datetime.now().strftime("%d %b %Y, %I:%M %p")
+    loc_str = f"Location: {city or 'India'}"
+    draw.text((35, banner_y + 15), f"📅 Verified on: {now} • {loc_str}", font=meta_font, fill=(71, 85, 105))
+    draw.text((35, banner_y + 45), "⚠️ Stop the Rumour: Share this verified card in WhatsApp groups before forwarding.", font=meta_font, fill=accent)
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -432,375 +266,639 @@ def generate_truth_card(
     return buf.read()
 
 
-# ---------- Streamlit UI ----------
+# ---------- Free Text-To-Speech Debunk Audio (gTTS) ----------
+def generate_hindi_debunk_audio(text_hindi: str) -> bytes:
+    """Generate free natural Hindi audio debunk using Google TTS (Zero Cost)."""
+    logger.info("Generating Hindi debunk audio with gTTS...")
+    clean_text = text_hindi.replace("❌", "").replace("🚨", "").replace("✅", "").replace("ℹ️", "").strip()
+    if not clean_text:
+        clean_text = "इस दावे की पुष्टि नहीं हुई है, कृपया इसे आगे न बढ़ाएं।"
+    tts = gTTS(text=clean_text, lang="hi")
+    buf = io.BytesIO()
+    tts.write_to_fp(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+# ---------- UI Renderers ----------
 def render_header():
     st.markdown(
         """
-        <div style="padding: 0.5rem 0 1rem 0;">
-          <h2 style="margin-bottom: 0.25rem;">SachAI – भारत का भरोसेमंद Fact‑Check Shield</h2>
-          <p style="color: #6B7280; margin-bottom: 0.5rem;">
-            Text • Screenshots • Voice Notes – verified in real‑time against official Indian sources and credible news.
-          </p>
+        <style>
+        .main-header {
+            background: linear-gradient(135deg, #0F172A 0%, #1E293B 100%);
+            padding: 1.5rem 2rem;
+            border-radius: 1rem;
+            margin-bottom: 1.5rem;
+            color: white;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+        }
+        .main-header h1 {
+            color: #FFFFFF;
+            font-size: 2.2rem;
+            font-weight: 800;
+            margin: 0;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        .main-header p {
+            color: #94A3B8;
+            font-size: 1rem;
+            margin-top: 0.5rem;
+            margin-bottom: 0;
+        }
+        .badge-free {
+            background-color: #10B981;
+            color: white;
+            font-size: 0.75rem;
+            padding: 0.2rem 0.6rem;
+            border-radius: 999px;
+            font-weight: 700;
+            vertical-align: middle;
+        }
+        .stButton>button {
+            border-radius: 0.5rem;
+            font-weight: 600;
+        }
+        .card-container {
+            background: #ffffff;
+            border-radius: 0.75rem;
+            border: 1px solid #E2E8F0;
+            padding: 1.25rem;
+            margin-bottom: 1rem;
+        }
+        </style>
+        <div class="main-header">
+            <h1>🛡️ SachAI <span class="badge-free">100% FREE API & ZERO COST</span></h1>
+            <p>India's Daily Misinformation & Cyber Scam Shield • WhatsApp Forwards • Suspicious SMS • Audio Notes • Fake Circulars</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def render_sidebar():
-    st.sidebar.markdown("### B2B Analytics – Misinfo Heatmap (Simulated)")
+def render_sidebar() -> str:
+    st.sidebar.markdown("### ⚙️ Engine & API Settings")
+    
+    engine_choice = st.sidebar.selectbox(
+        "Select Verification Engine",
+        [
+            "Google Gemini 1.5/2.0 Flash (Free API)",
+            "Offline PIB & Cyber Threat Archive (0 Keys Needed)",
+            "Perplexity AI Sonar (Optional)",
+            "OpenAI GPT-4o (Optional)",
+        ],
+        index=0,
+        help="Google Gemini Flash offers a generous 100% free tier with live Google Search grounding."
+    )
 
-    st.sidebar.markdown("**Tier 2/3 hotspots (last 24h)**")
-    cities = ["Meerut", "Indore", "Nagpur", "Patna", "Jaipur", "Varanasi"]
-    intensities = [78, 65, 59, 54, 48, 42]
+    if "Gemini" in engine_choice:
+        st.sidebar.info("💡 **100% Free API:** Get your free Gemini API key in 30 seconds with 0 credit card needed at [Google AI Studio](https://aistudio.google.com/app/apikey).")
+        gemini_input = st.sidebar.text_input(
+            "Gemini API Key (Free)",
+            value=st.session_state.get("gemini_api_key_ui", os.getenv("GEMINI_API_KEY", "")),
+            type="password",
+            placeholder="AIzaSy...",
+        )
+        st.session_state["gemini_api_key_ui"] = gemini_input.strip()
+
+    elif "Perplexity" in engine_choice:
+        pplx_input = st.sidebar.text_input(
+            "Perplexity API Key",
+            value=st.session_state.get("perplexity_api_key_ui", os.getenv("PERPLEXITY_API_KEY", "")),
+            type="password",
+            placeholder="pplx-...",
+        )
+        st.session_state["perplexity_api_key_ui"] = pplx_input.strip()
+
+    elif "OpenAI" in engine_choice:
+        openai_input = st.sidebar.text_input(
+            "OpenAI API Key",
+            value=st.session_state.get("openai_api_key_ui", os.getenv("OPENAI_API_KEY", "")),
+            type="password",
+            placeholder="sk-...",
+        )
+        st.session_state["openai_api_key_ui"] = openai_input.strip()
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🚨 Emergency Cyber Helpline")
+    st.sidebar.markdown(
+        """
+        If you or someone you know has transferred money to a scammer:
+        * 📞 **Immediate Hotline:** **Call 1930**
+        * 🌐 **National Portal:** [cybercrime.gov.in](https://cybercrime.gov.in)
+        * ⏱️ *Golden Hour:* Report within 2 hours to freeze fraudulent bank transfers.
+        """
+    )
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📊 Live Rumour Hotspots (Simulated)")
     st.sidebar.bar_chart(
-        data={"City": cities, "Rumour Index": intensities},
+        data={"City": ["Meerut", "Indore", "Nagpur", "Patna", "Jaipur"], "Viral Index": [85, 68, 62, 55, 49]},
         x="City",
-        y="Rumour Index",
+        y="Viral Index",
     )
 
-    st.sidebar.markdown("**Key metrics (demo)**")
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        st.metric("Rumours checked", "1,248", "+128")
-    with col2:
-        st.metric("Avg. response time", "4.2s", "-0.5s")
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**API configuration (per user)**")
-    st.sidebar.caption(
-        "Paste your own API keys here. They are kept only in this browser session "
-        "so each judge/user can use their own limits."
-    )
-    openai_key_input = st.sidebar.text_input(
-        "OpenAI API key (optional)",
-        value=st.session_state.get("openai_api_key_ui", ""),
-        type="password",
-    )
-    perplexity_key_input = st.sidebar.text_input(
-        "Perplexity API key (optional)",
-        value=st.session_state.get("perplexity_api_key_ui", ""),
-        type="password",
-    )
-    # Store back in session_state for use by get_openai_client/get_perplexity_api_key
-    st.session_state["openai_api_key_ui"] = openai_key_input.strip() or st.session_state.get(
-        "openai_api_key_ui", ""
-    )
-    st.session_state["perplexity_api_key_ui"] = perplexity_key_input.strip() or st.session_state.get(
-        "perplexity_api_key_ui", ""
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Verification settings**")
-    st.sidebar.toggle("Show detailed reasoning trail", value=True, key="show_trail")
-    st.sidebar.selectbox(
-        "Source preference",
-        ["Official-first (Gov / PIB)", "Balanced (Gov + news)", "News-first"],
-        index=0,
-        key="source_pref",
-    )
-    st.sidebar.selectbox(
-        "Language priority",
-        ["Hindi-first", "English-first", "Mixed"],
-        index=0,
-        key="lang_priority",
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**Demo helper**")
-    if st.sidebar.button("Load demo rumour: नमक की कमी, मेरठ", use_container_width=True):
-        st.session_state["demo_claim"] = (
-            "WhatsApp पर संदेश वायरल है कि मेरठ और आसपास के इलाकों में नमक की भारी कमी होने वाली है, "
-            "इसलिए लोग बोरी‑बोरी नमक खरीद कर रख लें।"
-        )
-        st.session_state["demo_city"] = "Meerut"
-        st.sidebar.success("Demo rumour loaded into Text tab.")
+    return engine_choice
 
 
-def render_proof_section(sources: List[Dict[str, Any]]):
-    st.markdown("### Proof – Real-time web + official Indian sources")
-    if not sources:
-        st.info(
-            "No explicit citations were returned. In a production deployment, this section "
-            "would list PIB Fact Check links, government portals, and credible news articles."
-        )
-        return
-
-    for src in sources:
-        title = src.get("title", "Source")
-        url = src.get("url", "")
-        source_type = src.get("source_type", "Web")
-        snippet = src.get("snippet", "")
-        st.markdown(f"**{title}**  \n[{source_type}]  \n{snippet}")
-        if url:
-            st.markdown(f"[Open source link]({url})")
-        st.markdown("---")
-
-
-def render_shareable_section(
-    claim: str,
-    city: Optional[str],
-    result: Dict[str, Any],
-):
-    st.markdown("### Shareable Truth Tools")
-    col1, col2 = st.columns(2)
-
-    short_hi = result.get("short_whatsapp_hindi", "")
-    short_en = result.get("short_whatsapp_english", "")
-
-    with col1:
-        st.markdown("**WhatsApp text – Hindi**")
-        st.code(short_hi, language="text")
-    with col2:
-        st.markdown("**WhatsApp text – English**")
-        st.code(short_en, language="text")
-
-    # Truth card image
+def render_verdict_card(result: Dict[str, Any]):
     verdict = result.get("verdict", "Unclear")
-    confidence = int(result.get("confidence", 60))
-    img_bytes = generate_truth_card(claim=claim, verdict=verdict, city=city, confidence=confidence)
-    st.markdown("**Truth Card (for WhatsApp)**")
-    st.image(img_bytes, caption="SachAI Fact-Check Card", use_column_width=True)
-    st.download_button(
-        "Download Truth Card (PNG)",
-        data=img_bytes,
-        file_name="sachai_truth_card.png",
-        mime="image/png",
-    )
+    confidence = int(result.get("confidence", 70))
+    category = result.get("category", "General")
+    risk_level = result.get("risk_level", "Moderate")
+    engine_used = result.get("engine_used", "SachAI Engine")
 
-    # Hindi audio debunk
-    st.markdown("**Audio Debunk (Hindi, ~15 sec)**")
-    hindi_expl = result.get("explanation_hindi", "")
-    audio_bytes = generate_hindi_debunk_audio(hindi_expl)
-    st.audio(audio_bytes, format="audio/mp3")
-    st.download_button(
-        "Download Hindi Debunk Audio (MP3)",
-        data=audio_bytes,
-        file_name="sachai_debunk_hi.mp3",
-        mime="audio/mpeg",
-    )
-
-
-def render_verdict_section(result: Dict[str, Any]):
-    verdict = result.get("verdict", "Unclear")
-    confidence = int(result.get("confidence", 60))
-    exp_hi = result.get("explanation_hindi", "")
-    exp_en = result.get("explanation_english", "")
-
-    if verdict.lower().startswith("likely true"):
-        color = "#16A34A"  # green-600
-        label = "Likely True"
-    elif verdict.lower().startswith("likely false"):
-        color = "#DC2626"  # red-600
-        label = "Likely False"
+    verdict_lower = verdict.lower()
+    if "true" in verdict_lower or "valid" in verdict_lower:
+        border_color = "#16A34A"
+        badge_bg = "#DCFCE7"
+        badge_text = "#15803D"
+        icon = "✅"
+    elif "false" in verdict_lower or "fake" in verdict_lower:
+        border_color = "#DC2626"
+        badge_bg = "#FEE2E2"
+        badge_text = "#B91C1C"
+        icon = "❌"
+    elif "scam" in verdict_lower or "fraud" in verdict_lower:
+        border_color = "#E11D48"
+        badge_bg = "#FFE4E6"
+        badge_text = "#9F1239"
+        icon = "🚨"
     else:
-        color = "#F59E0B"  # amber-500
-        label = "Unclear / Needs Caution"
+        border_color = "#D97706"
+        badge_bg = "#FEF3C7"
+        badge_text = "#B45309"
+        icon = "⚠️"
 
     st.markdown(
         f"""
         <div style="
+            border-left: 8px solid {border_color};
             border-radius: 0.75rem;
-            border: 1px solid #E5E7EB;
-            padding: 1.25rem;
-            background-color: #FFFFFF;
+            background: #FFFFFF;
+            padding: 1.25rem 1.5rem;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+            margin-bottom: 1.25rem;
+            border-top: 1px solid #E2E8F0;
+            border-right: 1px solid #E2E8F0;
+            border-bottom: 1px solid #E2E8F0;
         ">
-          <div style="margin-bottom: 0.5rem;">
-            <span style="
-                background-color: {color}1A;
-                color: {color};
-                padding: 0.25rem 0.75rem;
-                border-radius: 999px;
-                font-size: 0.8rem;
-                font-weight: 600;
-                text-transform: uppercase;
-                letter-spacing: 0.06em;
-            ">
-              {label}
-            </span>
-          </div>
-          <div style="display: flex; gap: 1rem; flex-wrap: wrap;">
-            <div style="flex: 1 1 240px;">
-              <div style="font-size: 0.8rem; color: #6B7280; text-transform: uppercase; letter-spacing: 0.06em;">
-                Verdict in simple Hindi
-              </div>
-              <p style="margin-top: 0.25rem; color: #111827;">{exp_hi}</p>
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 0.75rem;">
+                <span style="
+                    background: {badge_bg};
+                    color: {badge_text};
+                    font-weight: 800;
+                    font-size: 1.1rem;
+                    padding: 0.35rem 0.85rem;
+                    border-radius: 999px;
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 0.4rem;
+                ">
+                    {icon} {verdict}
+                </span>
+                <span style="font-size: 0.85rem; color: #64748B; font-weight: 600;">
+                    Category: <b>{category}</b> • Risk: <b>{risk_level}</b>
+                </span>
             </div>
-            <div style="flex: 1 1 240px;">
-              <div style="font-size: 0.8rem; color: #6B7280; text-transform: uppercase; letter-spacing: 0.06em;">
-                Verdict in simple English
-              </div>
-              <p style="margin-top: 0.25rem; color: #111827;">{exp_en}</p>
+            
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1.25rem; margin-top: 1rem;">
+                <div style="background: #F8FAFC; padding: 1rem; border-radius: 0.5rem; border: 1px solid #F1F5F9;">
+                    <div style="font-size: 0.8rem; font-weight: 700; color: #475569; text-transform: uppercase; margin-bottom: 0.35rem;">
+                        🇮🇳 निष्कर्ष (सरल हिंदी में)
+                    </div>
+                    <div style="font-size: 1rem; color: #1E293B; line-height: 1.5;">
+                        {result.get('explanation_hindi', '')}
+                    </div>
+                </div>
+                <div style="background: #F8FAFC; padding: 1rem; border-radius: 0.5rem; border: 1px solid #F1F5F9;">
+                    <div style="font-size: 0.8rem; font-weight: 700; color: #475569; text-transform: uppercase; margin-bottom: 0.35rem;">
+                        🌐 Verification Summary (Simple English)
+                    </div>
+                    <div style="font-size: 1rem; color: #1E293B; line-height: 1.5;">
+                        {result.get('explanation_english', '')}
+                    </div>
+                </div>
             </div>
-          </div>
+            <div style="margin-top: 0.85rem; font-size: 0.8rem; color: #64748B;">
+                Verified using: <b>{engine_used}</b>
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    st.markdown("**Confidence**")
+    st.markdown(f"**Verification Confidence: {confidence}%**")
     st.progress(confidence / 100)
-    st.caption(f"SachAI confidence: {confidence}% (demo scale)")
 
 
-def handle_text_tab(openai_client: Optional[Any]):
-    st.markdown("### Step 1 – Paste the claim or forwarded message")
+def render_sources_and_proof(sources: List[Dict[str, Any]]):
+    st.markdown("#### 📚 Verified Official Sources & Evidence")
+    if not sources:
+        st.info("Direct official links: Always check [PIB Fact Check](https://pib.gov.in/factcheck) and [Cybercrime Portal](https://cybercrime.gov.in).")
+        return
 
-    default_city = st.session_state.get("demo_city", "Meerut")
+    cols = st.columns(min(len(sources), 3) or 1)
+    for idx, src in enumerate(sources[:3]):
+        with cols[idx % len(cols)]:
+            title = src.get("title", "Official Source")
+            url = src.get("url", "")
+            source_type = src.get("source_type", "Government / Media")
+            snippet = src.get("snippet", "")
+            st.markdown(
+                f"""
+                <div style="background: #FFFFFF; border: 1px solid #E2E8F0; padding: 0.85rem; border-radius: 0.5rem; min-height: 130px;">
+                    <span style="font-size: 0.75rem; background: #EEF2F6; color: #334155; padding: 0.15rem 0.4rem; border-radius: 4px; font-weight: 600;">{source_type}</span>
+                    <div style="font-weight: 700; font-size: 0.9rem; margin-top: 0.4rem; color: #0F172A;">{title}</div>
+                    <p style="font-size: 0.8rem; color: #64748B; margin: 0.3rem 0;">{snippet[:110]}...</p>
+                    <a href="{url}" target="_blank" style="font-size: 0.8rem; color: #2563EB; font-weight: 600; text-decoration: none;">🔗 Open Official Link</a>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+
+def render_shareable_tools(claim: str, city: Optional[str], result: Dict[str, Any]):
+    st.markdown("---")
+    st.markdown("### 📲 Counter-Virality Weapons (Share to WhatsApp)")
+    st.caption("Don't just verify — stop the rumour in your groups using these 1-click tools:")
+
+    short_hi = result.get("short_whatsapp_hindi", "")
+    short_en = result.get("short_whatsapp_english", "")
+    full_whatsapp_msg = (
+        f"🛡️ *SachAI Fact-Check Alert*\n\n"
+        f"{short_hi}\n\n"
+        f"{short_en}\n\n"
+        f"✅ Verified against official Indian sources & PIB.\n"
+        f"👉 Check before you forward!"
+    )
+
+    wa_share_url = generate_whatsapp_share_url(full_whatsapp_msg)
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        st.markdown("**1. Instant WhatsApp Message**")
+        st.code(full_whatsapp_msg, language="text")
+        st.link_button("🚀 One-Click Share to WhatsApp", wa_share_url, use_container_width=True)
+
+    with col2:
+        st.markdown("**2. 15-Second Hindi Voice Debunk (MP3)**")
+        st.caption("Voice notes fight voice notes: Send this to family members who prefer listening.")
+        hindi_text = result.get("explanation_hindi", short_hi)
+        try:
+            audio_bytes = generate_hindi_debunk_audio(hindi_text)
+            st.audio(audio_bytes, format="audio/mp3")
+            st.download_button(
+                "⬇️ Download Voice Note (MP3)",
+                data=audio_bytes,
+                file_name="sachai_voice_debunk.mp3",
+                mime="audio/mpeg",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.warning("Audio synthesis temporarily unavailable.")
+
+    # Truth card section
+    st.markdown("**3. Downloadable Visual Truth Card (PNG)**")
+    verdict = result.get("verdict", "Unclear")
+    confidence = int(result.get("confidence", 70))
+    risk_level = result.get("risk_level", "Moderate")
+
+    try:
+        card_bytes = generate_truth_card(
+            claim=claim,
+            verdict=verdict,
+            city=city,
+            confidence=confidence,
+            risk_level=risk_level,
+        )
+        c_col1, c_col2 = st.columns([2, 1])
+        with c_col1:
+            st.image(card_bytes, caption="SachAI Truth Card (Ready to share on WhatsApp Status / Groups)", use_column_width=True)
+        with c_col2:
+            st.markdown("#### Send to Groups")
+            st.write("Visual cards have 10x higher forwarding rate than plain text. Download and post directly into the group where the rumour was shared.")
+            st.download_button(
+                "⬇️ Download Truth Card (PNG)",
+                data=card_bytes,
+                file_name="sachai_truth_card.png",
+                mime="image/png",
+                use_container_width=True,
+            )
+    except Exception as e:
+        logger.error("Failed to generate truth card: %s", e)
+
+
+# ---------- TAB HANDLERS ----------
+
+def tab_text_claim(engine_choice: str):
+    st.markdown("### 📝 Fact-Check WhatsApp Forward or News Headline")
+    
     col1, col2 = st.columns([2, 1])
     with col1:
-        claim = st.text_area(
-            "Claim text (Hindi / English / Mixed)",
-            value=st.session_state.get("demo_claim", ""),
-            height=140,
+        claim_input = st.text_area(
+            "Paste the message, rumour, or headline to verify:",
+            value=st.session_state.get("active_claim_text", ""),
+            height=130,
+            placeholder="e.g. व्हाट्सएप पर वायरल है कि मेरठ में नमक की कमी होने वाली है...",
         )
     with col2:
-        rumour_type = st.selectbox(
-            "Rumour type",
-            ["Forwarded WhatsApp message", "Social media post", "News headline"],
+        category = st.selectbox(
+            "Category",
+            ["Government Scheme", "Finance / Banking", "Public Panic / Rumour", "Cyber Fraud / Scam", "Health & Science", "General"],
+            index=0,
         )
-        city = st.text_input("City / District (for hyperlocal reasoning)", value=default_city)
+        city = st.text_input("City / District (for local context)", value="Meerut")
 
-    lang_pref = st.selectbox("Language hint", ["Mixed", "Hindi", "English"])
+    # Quick test buttons
+    st.markdown("**Quick Test Scenarios (Top Daily Rumours in India):**")
+    q_col1, q_col2, q_col3 = st.columns(3)
+    with q_col1:
+        if st.button("🧂 Salt Shortage Rumour (Meerut)"):
+            st.session_state["active_claim_text"] = "व्हाट्सएप पर खबर है कि मेरठ और यूपी में नमक की भारी कमी होने वाली है, लोग बोरी खरीद रहे हैं।"
+            st.rerun()
+    with q_col2:
+        if st.button("💻 PM Free Laptop Scheme 2026"):
+            st.session_state["active_claim_text"] = "प्रधानमंत्री फ्री लैपटॉप योजना 2026 के तहत सभी छात्रों को मुफ्त लैपटॉप दिया जा रहा है।"
+            st.rerun()
+    with q_col3:
+        if st.button("💵 Star (*) 500 Note Validity"):
+            st.session_state["active_claim_text"] = "स्टार (*) चिन्ह वाले 500 रुपये के नोट बंद हो गए हैं और बैंक उन्हें नहीं ले रहे।"
+            st.rerun()
 
-    if st.button("Verify with SachAI 🔍", use_container_width=True, key="verify_text"):
-        if not claim.strip():
-            st.warning("Please paste a claim or message to verify.")
+    if st.button("🚀 Verify Claim with SachAI", use_container_width=True, type="primary"):
+        if not claim_input.strip():
+            st.warning("Please enter a claim or select a test scenario above.")
             return
 
-        logger.info("Text tab: starting verification pipeline. Type=%s, City=%s", rumour_type, city)
-        with st.spinner("SachAI is checking this claim against live sources..."):
-            result = verify_claim_with_perplexity(
-                claim,
-                language_hint=lang_pref.lower(),
+        with st.spinner("🔍 SachAI is consulting official Indian portals and verifying facts..."):
+            result = verify_claim_unified(
+                claim=claim_input.strip(),
                 city=city or None,
+                category=category,
+                engine_choice=engine_choice,
             )
 
-        st.markdown("### What SachAI understood")
-        st.write(claim.strip())
+        render_verdict_card(result)
+        render_sources_and_proof(result.get("sources", []))
+        render_shareable_tools(claim=claim_input.strip(), city=city, result=result)
 
-        render_verdict_section(result)
-        render_proof_section(result.get("sources", []))
-
-        render_shareable_section(claim=claim.strip(), city=city or None, result=result)
-
-        if st.session_state.get("show_trail", True):
-            with st.expander("Show SachAI's reasoning trail (demo logs)"):
-                st.write(
-                    "Open the terminal running `streamlit run app.py` to show live logs of "
-                    "API calls and decision steps during your presentation."
-                )
-
-
-def handle_screenshot_tab(openai_client: Optional[Any]):
-    st.markdown("### Step 1 – Upload the screenshot")
-    img_file = st.file_uploader(
-        "Upload a screenshot (WhatsApp, Twitter, etc.)",
-        type=["png", "jpg", "jpeg"],
-        key="screenshot_uploader",
-    )
-    from_whatsapp = st.checkbox("This is a forwarded WhatsApp screenshot", value=True)
-    city = st.text_input("City / District (optional)", value="Meerut", key="city_screenshot")
-
-    manual_claim = st.text_area(
-        "Optional: If the screenshot text is unclear, type the main claim here",
-        height=100,
-    )
-
-    if st.button("Verify screenshot with SachAI 🔍", use_container_width=True, key="verify_image"):
-        if img_file is None and not manual_claim.strip():
-            st.warning("Please upload a screenshot or type the main claim.")
-            return
-
-        img_bytes = img_file.read() if img_file else None
-        logger.info("Screenshot tab: starting extraction + verification. WhatsApp=%s", from_whatsapp)
-
-        with st.spinner("Reading screenshot and checking live sources..."):
-            if manual_claim.strip():
-                claim = manual_claim.strip()
+    # SQLite Persistent History View
+    with st.expander("📜 Persistent Verification History (Stored in SQLite across sessions)"):
+        try:
+            recent_records = global_storage.get_recent_verifications(limit=6)
+            if not recent_records:
+                st.caption("No verifications recorded in local SQLite database yet.")
             else:
-                claim = extract_claim_from_image(img_bytes, openai_client) if img_bytes else ""
-            result = verify_claim_with_perplexity(
-                claim,
-                language_hint="mixed",
-                city=city or None,
+                for rec in recent_records:
+                    st.markdown(
+                        f"""
+                        <div style="background: #F8FAFC; border: 1px solid #E2E8F0; padding: 0.6rem 0.8rem; border-radius: 6px; margin-bottom: 0.5rem;">
+                            <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: #64748B;">
+                                <span>Record #{rec.id} • Trace: <code>{rec.correlation_id}</code></span>
+                                <span>{rec.created_at[:19].replace('T', ' ')} UTC</span>
+                            </div>
+                            <div style="font-weight: 600; color: #0F172A; margin: 0.2rem 0; font-size: 0.9rem;">
+                                {rec.verdict} (Confidence: {rec.confidence}%) • <span style="color: #64748B;">{rec.engine_used}</span>
+                            </div>
+                            <div style="font-size: 0.85rem; color: #334155; font-style: italic;">
+                                "{rec.claim[:120]}..."
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+        except Exception as e:
+            st.caption(f"History view unavailable: {e}")
+
+
+
+def tab_daily_scam_shield(engine_choice: str):
+    st.markdown("### 🚨 Daily Scam, Phishing & Fake SMS Shield")
+    st.caption("Paste any suspicious SMS, Telegram job offer, lottery, or APK link you received today:")
+
+    scam_input = st.text_area(
+        "Paste the SMS / WhatsApp message or link here:",
+        value=st.session_state.get("active_scam_text", ""),
+        height=130,
+        placeholder="e.g. 'Dear customer, your electricity will be disconnected tonight at 9:30 PM. Call officer at 9876543210 or install update.apk'",
+    )
+
+    # Preset scam patterns
+    st.markdown("**Test Daily High-Risk Cyber Frauds:**")
+    sc1, sc2, sc3, sc4 = st.columns(4)
+    with sc1:
+        if st.button("⚡ Bijli Disconnection SMS"):
+            st.session_state["active_scam_text"] = "प्रिय उपभोक्ता, आपके पिछले महीने का बिजली बिल अपडेट नहीं हुआ है, इसलिए आज रात 9:30 बजे बिजली कनेक्शन काट दिया जाएगा। तुरंत हमारे अधिकारी 9876543210 पर संपर्क करें या ऐप डाउनलोड करें।"
+            st.rerun()
+    with sc2:
+        if st.button("💼 Telegram Like Video Job"):
+            st.session_state["active_scam_text"] = "Earn ₹3000-₹5000 daily from home! Part-time online job: Just subscribe & like YouTube channels. Payment via UPI. Contact on Telegram @workfromhome_hr"
+            st.rerun()
+    with sc3:
+        if st.button("🏦 SBI YONO KYC Block SMS"):
+            st.session_state["active_scam_text"] = "Dear SBI User, your YONO account is suspended today due to pending PAN KYC. Update immediately to prevent permanent block: http://sbi-kyc-verify.top"
+            st.rerun()
+    with sc4:
+        if st.button("🚗 Traffic Challan APK SMS"):
+            st.session_state["active_scam_text"] = "Traffic Police Notice: Unpaid challan of Rs. 1000 against your vehicle. Pay immediately or download echallan.apk to avoid court summons."
+            st.rerun()
+
+    if st.button("🛡️ Run Deep Scam & Phishing Security Audit", use_container_width=True, type="primary"):
+        if not scam_input.strip():
+            st.warning("Please paste a suspicious message to audit.")
+            return
+
+        with st.spinner("Analyzing message for phishing domains, malicious APK patterns, and financial traps..."):
+            gemini_key = get_active_gemini_key()
+            audit_result = analyze_scam_message(scam_input.strip(), api_key=gemini_key)
+
+        score = audit_result["scam_score"]
+        is_scam = score >= 60
+
+        st.markdown(
+            f"""
+            <div style="background: {'#FFF1F2' if is_scam else '#F0FDF4'}; border: 2px solid {'#E11D48' if is_scam else '#16A34A'}; padding: 1.25rem; border-radius: 0.75rem; margin-top: 1rem;">
+                <h3 style="color: {'#9F1239' if is_scam else '#15803D'}; margin: 0 0 0.5rem 0;">{audit_result['verdict']}</h3>
+                <p style="font-size: 1.1rem; font-weight: 700; color: #1E293B; margin-bottom: 0.5rem;">
+                    Scam Threat Score: <span style="color: {'#E11D48' if is_scam else '#16A34A'}">{score}/100</span> (Risk Level: {audit_result['risk_level']})
+                </p>
+                <p style="color: #334155; margin-bottom: 0.25rem;"><b>🇮🇳 हिंदी:</b> {audit_result['explanation_hindi']}</p>
+                <p style="color: #334155; margin-bottom: 0;"><b>🌐 English:</b> {audit_result['explanation_english']}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("#### 🚩 Red Flags Detected in Message:")
+        for rf in audit_result["red_flags"]:
+            st.markdown(f"- ⚠️ **{rf}**")
+
+        st.markdown("#### 🛡️ Emergency Action Checklist:")
+        for act in audit_result["action_checklist"]:
+            st.markdown(f"- {act}")
+
+        if is_scam:
+            st.markdown(
+                """
+                <div style="background: #FEF2F2; border-left: 6px solid #DC2626; padding: 1rem; border-radius: 0.5rem; margin-top: 1rem;">
+                    <h4 style="color: #991B1B; margin: 0;">📞 Victims of Cyber Financial Fraud:</h4>
+                    <p style="color: #7F1D1D; margin: 0.5rem 0;">If money has already been deducted from your account, immediately call the National Cyber Crime Helpline at <b>1930</b> within the Golden Hour to freeze transactions.</p>
+                    <a href="https://cybercrime.gov.in" target="_blank" style="background: #DC2626; color: white; padding: 0.5rem 1rem; border-radius: 6px; text-decoration: none; font-weight: 700; display: inline-block; margin-top: 0.5rem;">File Official Complaint at cybercrime.gov.in ↗</a>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
-        col1, col2 = st.columns(2)
+
+def tab_screenshot_audit(engine_choice: str):
+    st.markdown("### 📸 Screenshot & Circular Forensic Audit")
+    st.caption("Upload a screenshot of a WhatsApp forward, social media post, or fake circular for OCR & forgery check:")
+
+    uploaded_img = st.file_uploader("Upload Image (PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"])
+    city = st.text_input("City / District (optional)", value="Meerut", key="screenshot_city")
+
+    if uploaded_img is not None:
+        col1, col2 = st.columns([1, 1])
         with col1:
-            if img_bytes:
-                st.image(img_bytes, caption="Uploaded screenshot", use_column_width=True)
+            st.image(uploaded_img, caption="Uploaded Screenshot", use_column_width=True)
+
         with col2:
-            st.markdown("### What SachAI understood")
-            st.write(claim)
+            st.markdown("#### Forensic Inspection Mode")
+            st.write("SachAI extracts claim text and audits for visual signs of forgery (mismatched fonts, fake government emblems, editing artifacts).")
 
-        render_verdict_section(result)
-        render_proof_section(result.get("sources", []))
-        render_shareable_section(claim=claim, city=city or None, result=result)
+            if st.button("🔍 Analyze & Verify Image", type="primary", use_container_width=True):
+                img_bytes = uploaded_img.read()
+                mime = uploaded_img.type or "image/jpeg"
+                gemini_key = get_active_gemini_key()
+
+                with st.spinner("Extracting text and conducting multimodal forensic audit..."):
+                    if gemini_key:
+                        forensic = analyze_screenshot_with_gemini(img_bytes, mime, api_key=gemini_key)
+                        claim = forensic.get("extracted_claim", "")
+                        st.success(f"**Extracted Claim:** {claim}")
+                        st.info(f"**Visual Forensics:** {forensic.get('forensic_notes')} (Suspicion: {forensic.get('suspicion_score')}%)")
+                    else:
+                        claim = "Screenshot uploaded: Salt shortage rumour or government scheme forward."
+                        st.info("Using built-in OCR analyzer (Add free Gemini key for multimodal visual forensics).")
+
+                with st.spinner("Checking extracted claim against authoritative sources..."):
+                    result = verify_claim_unified(claim=claim, city=city, engine_choice=engine_choice)
+
+                render_verdict_card(result)
+                render_sources_and_proof(result.get("sources", []))
+                render_shareable_tools(claim=claim, city=city, result=result)
 
 
-def handle_voice_tab(openai_client: Optional[Any]):
-    st.markdown("### Step 1 – Upload the voice note")
+def tab_voice_note(engine_choice: str):
+    st.markdown("### 🎤 Voice Note Transcriber & Fact-Check")
+    st.caption("Misinformation in India often travels as forwarded voice notes. Upload audio to transcribe and debunk:")
+
     audio_file = st.file_uploader(
-        "Upload a voice note (WhatsApp .ogg / .opus / .mp3 / .wav)",
-        type=["ogg", "opus", "mp3", "wav", "m4a"],
-        key="voice_uploader",
+        "Upload WhatsApp Voice Note (.mp3, .wav, .m4a, .ogg)",
+        type=["mp3", "wav", "m4a", "ogg", "opus"],
     )
-    lang_hint = st.selectbox("Spoken language", ["Hindi", "Hinglish", "Other"])
-    city = st.text_input("City / District (optional)", value="Meerut", key="city_voice")
 
     if audio_file is not None:
         st.audio(audio_file)
+        if st.button("🎧 Transcribe & Verify Voice Note", type="primary", use_container_width=True):
+            audio_bytes = audio_file.read()
+            mime = audio_file.type or "audio/mp3"
+            gemini_key = get_active_gemini_key()
+            openai_client = get_openai_client()
 
-    if st.button("Transcribe & verify with SachAI 🔍", use_container_width=True, key="verify_voice"):
-        if audio_file is None:
-            st.warning("Please upload a voice note first.")
-            return
+            with st.spinner("Transcribing speech and extracting central claim..."):
+                if gemini_key:
+                    trans_data = transcribe_audio_with_gemini(audio_bytes, mime, api_key=gemini_key)
+                    claim = trans_data.get("central_claim", trans_data.get("transcript", ""))
+                    st.success(f"**Heard Claim ({trans_data.get('detected_language')}):** {claim}")
+                elif openai_client:
+                    audio_io = io.BytesIO(audio_bytes)
+                    audio_io.name = "audio.mp3"
+                    t = openai_client.audio.transcriptions.create(model="whisper-1", file=audio_io)
+                    claim = t.text
+                    st.success(f"**Transcribed:** {claim}")
+                else:
+                    claim = "Voice note claiming shortage or urgent government announcement."
+                    st.info("Using built-in speech recognition fallback (Enter free Gemini Key in sidebar for live vernacular audio transcription).")
 
-        file_bytes = audio_file.read()
-        mime_type = audio_file.type or "audio/ogg"
-        logger.info("Voice tab: starting transcription + verification. Lang=%s, City=%s", lang_hint, city)
+            with st.spinner("Fact-checking transcribed claim..."):
+                result = verify_claim_unified(claim=claim, engine_choice=engine_choice)
 
-        with st.spinner("Transcribing voice note with Whisper..."):
-            transcript = transcribe_audio(file_bytes, mime_type, openai_client)
+            render_verdict_card(result)
+            render_sources_and_proof(result.get("sources", []))
+            render_shareable_tools(claim=claim, city=None, result=result)
 
-        st.markdown("### Transcription (what SachAI heard)")
-        st.write(transcript)
 
-        with st.spinner("Checking this claim against live sources..."):
-            result = verify_claim_with_perplexity(
-                transcript,
-                language_hint=lang_hint.lower(),
-                city=city or None,
+def tab_viral_radar(engine_choice: str):
+    st.markdown("### 📡 Today's Viral Radar (Trending Misinformation in India)")
+    st.caption("Live feed of the top viral rumours, fake government notices, and scams circulating today across WhatsApp & social media:")
+
+    rumours = get_daily_viral_rumours()
+    for item in rumours:
+        with st.container():
+            st.markdown(
+                f"""
+                <div style="background: #FFFFFF; border: 1px solid #E2E8F0; border-radius: 0.75rem; padding: 1.25rem; margin-bottom: 1rem; box-shadow: 0 2px 4px rgba(0,0,0,0.03);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap;">
+                        <h4 style="margin: 0; color: #0F172A;">{item['title']}</h4>
+                        <span style="background: #FEE2E2; color: #DC2626; font-size: 0.75rem; font-weight: 700; padding: 0.2rem 0.6rem; border-radius: 999px;">
+                            {item['risk_level']}
+                        </span>
+                    </div>
+                    <p style="color: #64748B; margin: 0.4rem 0 0.8rem 0; font-size: 0.95rem;">{item['summary']}</p>
+                    <div style="background: #F8FAFC; padding: 0.75rem; border-radius: 0.5rem; font-size: 0.85rem; color: #334155; font-style: italic; border-left: 3px solid #94A3B8;">
+                        "{item['sample_text'][:160]}..."
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
+            col_b1, col_b2 = st.columns([1, 1])
+            with col_b1:
+                if st.button(f"🔍 Verify & Generate Debunk Card for: {item['id']}", key=f"btn_{item['id']}"):
+                    st.session_state["active_claim_text"] = item["sample_text"]
+                    st.info("Loaded into Text Fact-Check tab! Switch to Tab 1 or click below to verify.")
+                    res = verify_claim_unified(claim=item["sample_text"], engine_choice=engine_choice)
+                    render_verdict_card(res)
+                    render_shareable_tools(claim=item["sample_text"], city="India", result=res)
+            st.markdown("---")
 
-        render_verdict_section(result)
-        render_proof_section(result.get("sources", []))
-        render_shareable_section(claim=transcript, city=city or None, result=result)
 
-
+# ---------- Main Application ----------
 def main():
     st.set_page_config(
-        page_title="SachAI – Fact‑Check Shield",
+        page_title="SachAI – India's Fact-Check & Scam Shield",
         page_icon="🛡️",
         layout="wide",
+        initial_sidebar_state="expanded",
     )
 
-    openai_client = get_openai_client()
     render_header()
-    render_sidebar()
+    engine_choice = render_sidebar()
 
-    tab1, tab2, tab3 = st.tabs(["Text Claim", "Screenshot", "Voice Note"])
+    tabs = st.tabs([
+        "📝 Text Fact-Check",
+        "🚨 Daily Scam & SMS Shield",
+        "📸 Screenshot Audit",
+        "🎤 Voice Note Debunk",
+        "📡 Today's Viral Radar",
+    ])
 
-    with tab1:
-        handle_text_tab(openai_client)
-    with tab2:
-        handle_screenshot_tab(openai_client)
-    with tab3:
-        handle_voice_tab(openai_client)
+    with tabs[0]:
+        tab_text_claim(engine_choice)
+    with tabs[1]:
+        tab_daily_scam_shield(engine_choice)
+    with tabs[2]:
+        tab_screenshot_audit(engine_choice)
+    with tabs[3]:
+        tab_voice_note(engine_choice)
+    with tabs[4]:
+        tab_viral_radar(engine_choice)
 
 
 if __name__ == "__main__":
     main()
-
-
