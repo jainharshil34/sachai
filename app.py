@@ -494,6 +494,116 @@ def render_verdict_card(result: Dict[str, Any]):
     st.progress(confidence / 100)
 
 
+def render_investigation_report(result: Dict[str, Any]):
+    """Renders Phase 2 Investigation Report, Contradiction Radar, and Syndication Graph."""
+    report = result.get("investigation_report")
+    if not report:
+        return
+
+    st.markdown("---")
+    st.markdown("### 🔬 Evidence Provenance & Contradiction Radar")
+
+    sufficiency = report.get("sufficiency", {})
+    outcome = sufficiency.get("outcome", "insufficient_evidence")
+
+    # Sufficiency KPI row
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    with kpi1:
+        st.metric("Evidence Sufficiency", f"{int(sufficiency.get('score', 0.5) * 100)}%")
+    with kpi2:
+        st.metric("Source Independence", f"{int(sufficiency.get('source_independence', 1.0) * 100)}%")
+    with kpi3:
+        st.metric("Claim Relevance", f"{int(sufficiency.get('claim_relevance', 1.0) * 100)}%")
+    with kpi4:
+        has_primary = "✅ Yes" if sufficiency.get("has_primary_source") or sufficiency.get("has_tier1_source") else "❌ No"
+        st.metric("Official / Primary", has_primary)
+
+    # Abstention / Disagreement Callout
+    abstention = report.get("abstention_reason")
+    if abstention:
+        st.warning(f"⚖️ **Abstention Rationale:** {abstention}")
+
+    # Contradiction Radar Tabs
+    sup_passages = report.get("supporting_passages", [])
+    con_passages = report.get("contradicting_passages", [])
+    neutral_passages = report.get("neutral_passages", [])
+
+    radar_tab1, radar_tab2, radar_tab3 = st.tabs([
+        f"✅ Supporting Passages ({len(sup_passages)})",
+        f"❌ Contradicting Passages ({len(con_passages)})",
+        f"ℹ️ Neutral / Background ({len(neutral_passages)})",
+    ])
+
+    with radar_tab1:
+        if not sup_passages:
+            st.caption("No passages directly asserting or confirming the claim.")
+        for p in sup_passages:
+            with st.container():
+                st.markdown(f"**{p.get('title', 'Source')}** (`{p.get('domain')}` • Tier {p.get('authority_tier')})")
+                st.info(f"\"{p.get('passage')}\"")
+                if p.get("canonical_url"):
+                    st.caption(f"[Open Verified URL]({p.get('canonical_url')})")
+
+    with radar_tab2:
+        if not con_passages:
+            st.caption("No passages directly refuting or contradicting the claim.")
+        for p in con_passages:
+            with st.container():
+                st.markdown(f"**{p.get('title', 'Source')}** (`{p.get('domain')}` • Tier {p.get('authority_tier')})")
+                st.error(f"\"{p.get('passage')}\"")
+                if p.get("canonical_url"):
+                    st.caption(f"[Open Verified URL]({p.get('canonical_url')})")
+
+    with radar_tab3:
+        if not neutral_passages:
+            st.caption("No neutral or contextual passages.")
+        for p in neutral_passages:
+            st.markdown(f"- `{p.get('domain')}`: {p.get('passage')[:120]}...")
+
+    # Provenance & Syndication Graph
+    relationships = report.get("evidence_relationships", [])
+    if relationships:
+        with st.expander("🔗 Source Provenance & Wire Syndication Graph"):
+            st.caption("Detects whether news outlets conducted independent reporting or repeated a syndicated wire copy (e.g. PTI/ANI):")
+            for rel in relationships:
+                icon = "📋 [Confirmed Wire]" if rel.get("relationship_type") == "confirmed_dependency" else ("⚠️ [Suspected Syndication]" if rel.get("relationship_type") == "suspected_dependency" else "🟢 [Independent]")
+                st.markdown(f"- **{icon}**: {rel.get('rationale')}")
+
+    # Structured Investigation Audit Trail
+    with st.expander("📋 Full Investigation Audit Trail (Facts vs Inferences vs Gaps)"):
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**🟢 Confirmed Facts (Tier 1/2 Grounded):**")
+            facts = report.get("confirmed_facts", [])
+            if facts:
+                for f in facts:
+                    st.markdown(f"- {f}")
+            else:
+                st.caption("No primary gazettes or IFCN facts identified.")
+
+            st.markdown("**🔵 Inferred Source Relationships:**")
+            inferred = report.get("inferred_relationships", [])
+            if inferred:
+                for inf in inferred:
+                    st.markdown(f"- {inf}")
+            else:
+                st.caption("All sources appear distinct.")
+
+        with c2:
+            st.markdown("**🟣 Model-Generated Assessments:**")
+            assessments = report.get("model_assessments", [])
+            for ass in assessments:
+                st.markdown(f"- {ass}")
+
+            st.markdown("**🔴 Unresolved Questions & Missing Information:**")
+            questions = report.get("unresolved_questions", [])
+            if questions:
+                for q in questions:
+                    st.markdown(f"- ❓ {q}")
+            else:
+                st.caption("No critical factual components missing.")
+
+
 def render_sources_and_proof(sources: List[Dict[str, Any]]):
     st.markdown("#### 📚 Verified Official Sources & Evidence")
     if not sources:
@@ -643,6 +753,7 @@ def tab_text_claim(engine_choice: str):
             )
 
         render_verdict_card(result)
+        render_investigation_report(result)
         render_sources_and_proof(result.get("sources", []))
         render_shareable_tools(claim=claim_input.strip(), city=city, result=result)
 
@@ -789,6 +900,7 @@ def tab_screenshot_audit(engine_choice: str):
                     result = verify_claim_unified(claim=claim, city=city, engine_choice=engine_choice)
 
                 render_verdict_card(result)
+                render_investigation_report(result)
                 render_sources_and_proof(result.get("sources", []))
                 render_shareable_tools(claim=claim, city=city, result=result)
 
@@ -829,6 +941,7 @@ def tab_voice_note(engine_choice: str):
                 result = verify_claim_unified(claim=claim, engine_choice=engine_choice)
 
             render_verdict_card(result)
+            render_investigation_report(result)
             render_sources_and_proof(result.get("sources", []))
             render_shareable_tools(claim=claim, city=None, result=result)
 
@@ -864,8 +977,10 @@ def tab_viral_radar(engine_choice: str):
                     st.info("Loaded into Text Fact-Check tab! Switch to Tab 1 or click below to verify.")
                     res = verify_claim_unified(claim=item["sample_text"], engine_choice=engine_choice)
                     render_verdict_card(res)
+                    render_investigation_report(res)
                     render_shareable_tools(claim=item["sample_text"], city="India", result=res)
             st.markdown("---")
+
 
 
 # ---------- Main Application ----------

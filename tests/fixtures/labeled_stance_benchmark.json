@@ -1,0 +1,114 @@
+[
+  {
+    "id": "bench-01",
+    "claim": "स्टार 500 का नोट अमान्य है",
+    "passage": "RBI clarifies that banknotes with a star mark are completely genuine and valid legal tender.",
+    "expected_stance": "contradicts",
+    "category": "financial_rumour",
+    "language": "hi-en"
+  },
+  {
+    "id": "bench-02",
+    "claim": "Banknotes with star mark are valid and genuine",
+    "passage": "RBI press release confirms star series currency notes are completely genuine legal tender.",
+    "expected_stance": "supports",
+    "category": "financial_rumour",
+    "language": "en"
+  },
+  {
+    "id": "bench-03",
+    "claim": "मेरठ में नमक की भारी कमी होने वाली है",
+    "passage": "Department of Consumer Affairs confirms adequate salt availability; rumours are baseless.",
+    "expected_stance": "contradicts",
+    "category": "panic_rumour",
+    "language": "hi-en"
+  },
+  {
+    "id": "bench-04",
+    "claim": "Police issuing digital arrest Skype call warrants",
+    "passage": "MHA issues strict warning against organized cyber syndicates. There is no system called digital arrest in Indian law.",
+    "expected_stance": "contradicts",
+    "category": "cyber_fraud",
+    "language": "en"
+  },
+  {
+    "id": "bench-05",
+    "claim": "Government announced 3 months free recharge for all students",
+    "passage": "PIB Fact Check debunks viral link: Central Government has made no such announcement. Link is fake and phishing.",
+    "expected_stance": "contradicts",
+    "category": "phishing",
+    "language": "en"
+  },
+  {
+    "id": "bench-06",
+    "claim": "Government approved PM Surya Ghar Muft Bijli Yojana",
+    "passage": "Cabinet approves PM Surya Ghar Muft Bijli Yojana with outlay of 75,000 crore for rooftop solar.",
+    "expected_stance": "supports",
+    "category": "government_scheme",
+    "language": "en"
+  },
+  {
+    "id": "bench-07",
+    "claim": "CBSE cancelled class 10 board exams for 2026",
+    "passage": "Indian Space Research Organisation successfully placed communication satellite into geostationary orbit.",
+    "expected_stance": "neutral_or_unrelated",
+    "category": "unrelated",
+    "language": "en"
+  },
+  {
+    "id": "bench-08",
+    "claim": "XYZ random unknown company founded in 1923 by John Doe",
+    "passage": "Department of Consumer Affairs confirms adequate salt availability across all states.",
+    "expected_stance": "neutral_or_unrelated",
+    "category": "unrelated",
+    "language": "en"
+  },
+  {
+    "id": "bench-09",
+    "claim": "Total cases recorded reached 500 in 2020",
+    "passage": "Official Ministry dataset recorded 1200 cumulative cases by 2023 following expanded testing.",
+    "expected_stance": "mixed_or_ambiguous",
+    "category": "temporal_update",
+    "language": "en"
+  },
+  {
+    "id": "bench-10",
+    "claim": "Poverty rate estimated at 45% based on online survey sample",
+    "passage": "NITI Aayog multidimensional poverty index based on national family health survey census recorded 14.96%.",
+    "expected_stance": "mixed_or_ambiguous",
+    "category": "differing_definitions",
+    "language": "en"
+  },
+  {
+    "id": "bench-11",
+    "claim": "RBI demonetized 100 rupee notes",
+    "passage": "Reserve Bank of India confirmed old series 100 rupee notes remain completely valid legal tender.",
+    "expected_stance": "contradicts",
+    "category": "financial_rumour",
+    "language": "en"
+  },
+  {
+    "id": "bench-12",
+    "claim": "ISRO launched Aditya L1 solar observatory",
+    "passage": "ISRO successfully launched India's first dedicated solar mission Aditya L1 aboard PSLV-C57.",
+    "expected_stance": "supports",
+    "category": "science",
+    "language": "en"
+  },
+  {
+    "id": "bench-13",
+    "claim": "WhatsApp forward claims electricity will be disconnected tonight",
+    "passage": "Power discom warns consumers against fraudulent disconnection SMS asking to call private mobile numbers.",
+    "expected_stance": "contradicts",
+    "category": "cyber_fraud",
+    "language": "en"
+  },
+  {
+    "id": "bench-14",
+    "claim": "Random claim with empty passage content",
+    "passage": "",
+    "expected_stance": "unassessable",
+    "category": "empty",
+    "language": "en"
+  }
+]
